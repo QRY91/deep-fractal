@@ -10,7 +10,7 @@ use winit::window::{Window, WindowId};
 
 use crate::gpu::GpuContext;
 use crate::perturbation;
-use crate::reference::ReferenceOrbit;
+use crate::reference::{ReferenceOrbit, SeriesApprox};
 use crate::render::Renderer;
 
 const DEFAULT_PRECISION: u32 = 128;
@@ -29,7 +29,9 @@ pub struct FractalState {
     pub auto_zoom: bool,
     pub zoom_rate: f64,
     pub frame_time_ms: f64,
+    pub sa_skipped: u32,
     pub boundary_lost: u32, // consecutive frames without boundary
+    pub steer_frame: u32,   // frame counter for steering interval
 }
 
 impl FractalState {
@@ -47,7 +49,9 @@ impl FractalState {
             auto_zoom: false,
             zoom_rate: 1.02,
             frame_time_ms: 0.0,
+            sa_skipped: 0,
             boundary_lost: 0,
+            steer_frame: 0,
         }
     }
 
@@ -120,38 +124,54 @@ impl App {
                 effective_iter,
                 state.zoom,
             );
+            let sa = SeriesApprox::from_orbit(&orbit);
+
             // Compute at half resolution for speed (~4x fewer pixels)
             let render_w = (size.width / 2).max(1);
             let render_h = (size.height / 2).max(1);
             let result = perturbation::compute(
                 &orbit,
+                &sa,
                 render_w,
                 render_h,
                 state.zoom,
                 effective_iter,
             );
+            state.sa_skipped = result.sa_skipped;
 
-            // Boundary seeking: steer center toward highest-variance region
+            // Boundary seeking: steer every 5 frames for smoother path
             if state.auto_zoom {
-                if let Some((ndc_x, ndc_y)) =
-                    perturbation::find_boundary_target(&result, effective_iter)
-                {
-                    state.boundary_lost = 0;
-                    let aspect = size.width as f64 / size.height as f64;
-                    let scale = 2.0 / state.zoom;
-                    let delta_re = ndc_x * aspect * scale;
-                    let delta_im = ndc_y * scale;
-
-                    let off_center = (ndc_x * ndc_x + ndc_y * ndc_y).sqrt();
-                    let blend = (off_center * 0.25).clamp(0.02, 0.15);
-                    state.center_re += delta_re * blend;
-                    state.center_im += delta_im * blend;
-                } else {
-                    state.boundary_lost += 1;
-                    if state.boundary_lost > 30 {
-                        state.auto_zoom = false;
+                state.steer_frame += 1;
+                if state.steer_frame >= 5 || state.boundary_lost > 0 {
+                    state.steer_frame = 0;
+                    if let Some((ndc_x, ndc_y)) =
+                        perturbation::find_boundary_target(&result, effective_iter)
+                    {
                         state.boundary_lost = 0;
-                        log::info!("Auto-explore stopped: boundary lost");
+                        let aspect = size.width as f64 / size.height as f64;
+                        let scale = 2.0 / state.zoom;
+                        let delta_re = ndc_x * aspect * scale;
+                        let delta_im = ndc_y * scale;
+
+                        let off_center = (ndc_x * ndc_x + ndc_y * ndc_y).sqrt();
+                        let blend = (off_center * 0.25).clamp(0.02, 0.15);
+                        state.center_re += delta_re * blend;
+                        state.center_im += delta_im * blend;
+                        log::debug!(
+                            "Boundary: ndc=({:.2},{:.2}) off={:.2} blend={:.3} zoom=10^{:.1} skip={}",
+                            ndc_x, ndc_y, off_center, blend, state.zoom.log10(), state.sa_skipped
+                        );
+                    } else {
+                        state.boundary_lost += 1;
+                        log::debug!(
+                            "Boundary lost frame {}/30 zoom=10^{:.1}",
+                            state.boundary_lost, state.zoom.log10()
+                        );
+                        if state.boundary_lost > 30 {
+                            state.auto_zoom = false;
+                            state.boundary_lost = 0;
+                            log::info!("Auto-explore stopped: boundary lost at zoom 10^{:.1}", state.zoom.log10());
+                        }
                     }
                 }
             }
@@ -244,7 +264,13 @@ impl App {
                 // Status
                 let zoom_exp = state.zoom.log10();
                 ui.label(format!("Zoom: 10^{:.1}", zoom_exp));
-                ui.label(format!("Iter: {}", state.effective_max_iter()));
+                let eff_iter = state.effective_max_iter();
+                let skip_pct = if eff_iter > 0 {
+                    state.sa_skipped as f64 / eff_iter as f64 * 100.0
+                } else {
+                    0.0
+                };
+                ui.label(format!("Iter: {} (SA skip {:.0}%)", eff_iter, skip_pct));
                 ui.label(format!("Frame: {:.0} ms", state.frame_time_ms));
                 ui.label(format!("({:.6e}, {:.6e})", cx, cy));
 
@@ -322,6 +348,7 @@ impl App {
                             state.center_im = Float::with_val(prec, *y);
                             state.zoom = 5.0; // Start close enough to see detail
                             state.auto_zoom = true;
+                            state.boundary_lost = 0;
                             state.needs_render = true;
                             state.needs_recompute = true;
                         }
